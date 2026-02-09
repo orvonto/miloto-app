@@ -55,20 +55,6 @@ def parse_date_yyyy_mm_dd(s: str) -> date | None:
         return None
 
 
-def parse_date_flexible(s: str) -> date | None:
-    """Acepta '2026-02-03' o '03/02/2026'."""
-    if not s:
-        return None
-    s = str(s).strip()
-    fmts = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"]
-    for f in fmts:
-        try:
-            return datetime.strptime(s, f).date()
-        except:
-            pass
-    return None
-
-
 def is_payroll_day(d: date) -> bool:
     return d.day in PAYROLL_DAYS
 
@@ -122,7 +108,20 @@ def weekly_weights_for_dates(week_dates):
     return weights
 
 
-def generate_combination(hot_numbers, hot_count):
+def has_run_of_three_or_more(sorted_nums):
+    """True si existe secuencia consecutiva de longitud >= 3."""
+    longest = 1
+    run = 1
+    for i in range(1, len(sorted_nums)):
+        if sorted_nums[i] == sorted_nums[i - 1] + 1:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 1
+    return longest >= 3
+
+
+def generate_combination(hot_numbers, hot_count, allow_sequences: bool):
     """Genera 1 combinación válida usando hot_numbers y hot_count (0..3)."""
     all_nums = list(range(1, MAX_NUMBER + 1))
     hot_numbers = [n for n in hot_numbers if 1 <= n <= MAX_NUMBER]
@@ -154,16 +153,10 @@ def generate_combination(hot_numbers, hot_count):
         if lows in (0, 5):
             continue
 
-        longest = 1
-        run = 1
-        for i in range(1, len(comb_list)):
-            if comb_list[i] == comb_list[i - 1] + 1:
-                run += 1
-                longest = max(longest, run)
-            else:
-                run = 1
-        if longest >= 3:
-            continue
+        # ✅ NUEVO: permitir o no secuencias
+        if not allow_sequences:
+            if has_run_of_three_or_more(comb_list):
+                continue
 
         if max(comb_list) <= 31:
             continue
@@ -202,48 +195,34 @@ def compute_hot_from_history(sorteos_url: str, jugadas_url: str, top_n: int = 6,
     - ratio = freq / played (si played>0)
     - score suavizado = (freq+1)/(played+2) para evitar trampas por muestras pequeñas
     """
-    # init
     freq = {n: 0 for n in range(1, MAX_NUMBER + 1)}
     played = {n: 0 for n in range(1, MAX_NUMBER + 1)}
 
-    # --- sorteos ---
     sorteos_rows = fetch_csv_rows(sorteos_url)
     for r in sorteos_rows:
-        # esperamos fecha_iso, N1..N5
         for k in ["N1", "N2", "N3", "N4", "N5"]:
             n = safe_int(r.get(k, ""))
             if n and 1 <= n <= MAX_NUMBER:
                 freq[n] += 1
 
-    # --- jugadas ---
     jugadas_rows = fetch_csv_rows(jugadas_url)
     for r in jugadas_rows:
-        # esperamos FECHA, J1..J5
         for k in ["J1", "J2", "J3", "J4", "J5"]:
             n = safe_int(r.get(k, ""))
             if n and 1 <= n <= MAX_NUMBER:
                 played[n] += 1
 
-    # armar tabla
     stats = []
     for n in range(1, MAX_NUMBER + 1):
         f = freq[n]
         p = played[n]
         ratio = (f / p) if p > 0 else 0.0
-        score = (f + 1) / (p + 2)  # suavizado
-        stats.append({
-            "n": n,
-            "freq": f,
-            "played": p,
-            "ratio": ratio,
-            "score": score
-        })
+        score = (f + 1) / (p + 2)
+        stats.append({"n": n, "freq": f, "played": p, "ratio": ratio, "score": score})
 
-    # ordenar por score, pero evitando números con 0 jugadas si min_played>0
     filtered = [x for x in stats if x["played"] >= min_played] if min_played > 0 else stats[:]
     filtered.sort(key=lambda x: (x["score"], x["freq"]), reverse=True)
 
-    # si no hay suficientes, completamos con los más frecuentes (para no quedarte corto)
     suggested = [x["n"] for x in filtered[:top_n]]
     if len(suggested) < top_n:
         remaining = [x for x in stats if x["n"] not in suggested]
@@ -253,9 +232,53 @@ def compute_hot_from_history(sorteos_url: str, jugadas_url: str, top_n: int = 6,
             if len(suggested) >= top_n:
                 break
 
-    # top table (para mostrar en pantalla)
     top_table = filtered[:max(top_n, 10)]
     return suggested, stats, top_table
+
+
+# ---------- Verificador de aciertos ----------
+
+def parse_draw_result(result_str: str):
+    """
+    Acepta: '04-05-06-17-36' o '4,5,6,17,36' o '04 05 06 17 36'
+    Devuelve lista de 5 ints o None si inválido.
+    """
+    if not result_str:
+        return None
+    s = str(result_str).strip()
+    s = s.replace("-", ",").replace(" ", ",").replace(";", ",")
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if len(parts) != 5:
+        return None
+    nums = []
+    for p in parts:
+        if not p.isdigit():
+            return None
+        n = int(p)
+        if n < 1 or n > MAX_NUMBER:
+            return None
+        nums.append(n)
+    # permitir repetidos? en MiLoto no deberían existir repetidos
+    if len(set(nums)) != 5:
+        return None
+    return nums
+
+
+def classify_hits(hits: int):
+    """
+    Mensaje simple. Ajusta el texto si la plataforma cambia reglas.
+    """
+    if hits <= 1:
+        return "❌ Sin premio"
+    if hits == 2:
+        return "🎟️ Ticket gratis (2 aciertos)"
+    if hits == 3:
+        return "💰 Premio (3 aciertos)"
+    if hits == 4:
+        return "💰💰 Premio mayor (4 aciertos)"
+    if hits == 5:
+        return "🏆 Premio máximo (5 aciertos)"
+    return ""
 
 
 @app.route("/", methods=["GET"])
@@ -264,15 +287,23 @@ def index():
     hot_str = request.args.get("hot", "")
     hot_count = request.args.get("hot_count", str(DEFAULT_HOT_COUNT))
 
-    start_str = request.args.get("start", "")  # YYYY-MM-DD
+    start_str = request.args.get("start", "")
     start_date = parse_date_yyyy_mm_dd(start_str)
+
+    # ✅ NUEVO: permitir secuencias
+    allow_seq = request.args.get("allow_seq", "0")  # 0=NO (estricto), 1=SI
+    allow_sequences = (allow_seq == "1")
+
+    # ✅ NUEVO: resultado del sorteo para verificar aciertos
+    draw_result_str = request.args.get("draw", "").strip()
+    draw_nums = parse_draw_result(draw_result_str)
 
     # Sheets params
     sorteos_url = request.args.get("sorteos_csv", DEFAULT_SORTEOS_CSV).strip()
     jugadas_url = request.args.get("jugadas_csv", DEFAULT_JUGADAS_CSV).strip()
     top_n = request.args.get("topn", "6")
     min_played = request.args.get("min_played", "1")
-    use_suggested = request.args.get("use_suggested", "0")  # 1 = usar sugeridos para rellenar hot
+    use_suggested = request.args.get("use_suggested", "0")
 
     # parse ints
     try:
@@ -293,9 +324,8 @@ def index():
     error = None
     sheets_error = None
     suggested_hot = None
-    hot_stats_table = None  # top preview
+    hot_stats_table = None
 
-    # --- if user requested suggested hot ---
     if use_suggested == "1":
         try:
             suggested_hot, all_stats, top_table = compute_hot_from_history(
@@ -305,18 +335,16 @@ def index():
                 min_played=min_played_int
             )
             hot_stats_table = top_table
-            hot_str = ", ".join(str(x) for x in suggested_hot)  # rellenar input
+            hot_str = ", ".join(str(x) for x in suggested_hot)
         except Exception as e:
             sheets_error = f"No pude leer/parsear tus CSV: {e}"
 
-    # --- parse hot numbers (manual o sugeridos) ---
     try:
         hot_numbers = parse_int_list(hot_str) if hot_str else DEFAULT_HOT
     except Exception as e:
         error = str(e)
         hot_numbers = DEFAULT_HOT
 
-    # base date
     base = start_date or datetime.now().date()
     start_monday = monday_of_week(base)
 
@@ -328,25 +356,43 @@ def index():
     w2 = weekly_weights_for_dates(week2)
 
     day_plan = [(d, w1[d]) for d in week1] + [(d, w2[d]) for d in week2]
-    total_bets = sum(n for _, n in day_plan)  # 12
+    total_bets = sum(n for _, n in day_plan)
 
-    # combos
     combos = []
     seen = set()
     while len(combos) < total_bets:
-        c = tuple(generate_combination(hot_numbers, hot_count_int))
+        c = tuple(generate_combination(hot_numbers, hot_count_int, allow_sequences))
         if c in seen:
             continue
         seen.add(c)
         combos.append(list(c))
 
-    # calendar
     calendar = []
     idx = 0
     for d, n in day_plan:
         assigned = combos[idx: idx + n]
         idx += n
         calendar.append((d, n, assigned))
+
+    # ✅ Verificación de aciertos (si el usuario metió resultado)
+    verify_rows = None
+    draw_invalid = False
+    if draw_result_str:
+        if not draw_nums:
+            draw_invalid = True
+        else:
+            draw_set = set(draw_nums)
+            verify_rows = []
+            # Aplanamos combos con su fecha
+            for d, n, cs in calendar:
+                for c in cs:
+                    hits = len(set(c) & draw_set)
+                    verify_rows.append({
+                        "date": d,
+                        "combo": c,
+                        "hits": hits,
+                        "msg": classify_hits(hits)
+                    })
 
     day_names = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
     month_names = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
@@ -379,6 +425,7 @@ def index():
     th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; font-size: 13px; }
     th { font-weight: 700; }
     .muted { color:#777; }
+    .pill { display:inline-block; padding:3px 10px; border-radius:999px; font-size:12px; background:#f0f0f0; margin-right:6px; }
   </style>
 </head>
 <body>
@@ -424,6 +471,15 @@ def index():
         </select>
       </div>
 
+      <div class="field">
+        <label>Permitir secuencias (4-5-6)</label>
+        <select id="allowSeq">
+          <option value="0" {% if not allow_sequences %}selected{% endif %}>NO (modo estricto)</option>
+          <option value="1" {% if allow_sequences %}selected{% endif %}>SÍ (más realista)</option>
+        </select>
+        <div class="hint">Si pones NO, se evitan secuencias de 3+ consecutivos.</div>
+      </div>
+
       <button id="saveBtn" type="button">💾 Guardar</button>
       <button id="genBtn" type="button">⚡ Generar plan</button>
     </div>
@@ -432,6 +488,61 @@ def index():
       ✅ Se guarda en tu navegador (celular/PC) usando LocalStorage.<br>
       Si cambias de navegador, tendrás que volver a poner la lista.
     </div>
+  </div>
+
+  <div class="card">
+    <div class="date">Verificar aciertos (pega el resultado oficial)</div>
+    <div class="row">
+      <div class="field" style="flex:2; min-width:260px;">
+        <label>Resultado del sorteo (5 números)</label>
+        <input id="drawInput" style="width:100%;" placeholder="Ej: 04-05-06-17-36" value="{{ draw_result_str|e }}">
+        <div class="hint">Acepta: 04-05-06-17-36 o 4,5,6,17,36</div>
+      </div>
+      <button id="checkBtn" type="button">✅ Calcular aciertos</button>
+      <div class="field" style="min-width:260px;">
+        <label>Guía rápida</label>
+        <div class="small">
+          <span class="pill">0-1: nada</span>
+          <span class="pill">2: ticket</span>
+          <span class="pill">3+: premio</span>
+        </div>
+      </div>
+    </div>
+
+    {% if draw_invalid %}
+      <div class="warn" style="margin-top:10px;">
+        Resultado inválido. Deben ser 5 números (1..39) sin repetir.
+      </div>
+    {% endif %}
+
+    {% if verify_rows %}
+      <div style="margin-top:12px;">
+        <div class="small"><b>Resultados vs tus jugadas del plan actual</b></div>
+        <table style="margin-top:6px;">
+          <thead>
+            <tr>
+              <th>Fecha</th>
+              <th>Jugada</th>
+              <th>Aciertos</th>
+              <th>Clasificación</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in verify_rows %}
+              <tr>
+                <td>{{ day_names[r.date.weekday()] }} {{ r.date.day }}/{{ r.date.month }}/{{ r.date.year }}</td>
+                <td><b>{{ r.combo|join(' - ') }}</b></td>
+                <td><b>{{ r.hits }}</b></td>
+                <td>{{ r.msg }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        <div class="hint" style="margin-top:8px;">
+          Esto solo “clasifica” según aciertos; confirma reglas exactas en la plataforma (pueden variar).
+        </div>
+      </div>
+    {% endif %}
   </div>
 
   <div class="card">
@@ -529,10 +640,14 @@ def index():
     const jugadasCsv = document.getElementById('jugadasCsv');
     const topN = document.getElementById('topN');
     const minPlayed = document.getElementById('minPlayed');
+    const allowSeq = document.getElementById('allowSeq');
+
+    const drawInput = document.getElementById('drawInput');
 
     const saveBtn = document.getElementById('saveBtn');
     const genBtn  = document.getElementById('genBtn');
     const suggestBtn = document.getElementById('suggestBtn');
+    const checkBtn = document.getElementById('checkBtn');
 
     function loadSettings(){
       const savedHot = localStorage.getItem('miloto_hot');
@@ -542,6 +657,8 @@ def index():
       const savedJugadas = localStorage.getItem('miloto_jugadas_csv');
       const savedTopN = localStorage.getItem('miloto_topn');
       const savedMinPlayed = localStorage.getItem('miloto_min_played');
+      const savedAllowSeq = localStorage.getItem('miloto_allow_seq');
+      const savedDraw = localStorage.getItem('miloto_draw');
 
       if(savedHot && !hotInput.value) hotInput.value = savedHot;
       if(savedCount) hotCount.value = savedCount;
@@ -561,6 +678,8 @@ def index():
       if(savedJugadas && (!jugadasCsv.value || jugadasCsv.value.trim().length === 0)) jugadasCsv.value = savedJugadas;
       if(savedTopN) topN.value = savedTopN;
       if(savedMinPlayed) minPlayed.value = savedMinPlayed;
+      if(savedAllowSeq) allowSeq.value = savedAllowSeq;
+      if(savedDraw && (!drawInput.value || drawInput.value.trim().length === 0)) drawInput.value = savedDraw;
     }
 
     function saveSettings(){
@@ -571,6 +690,8 @@ def index():
       localStorage.setItem('miloto_jugadas_csv', jugadasCsv.value);
       localStorage.setItem('miloto_topn', topN.value);
       localStorage.setItem('miloto_min_played', minPlayed.value);
+      localStorage.setItem('miloto_allow_seq', allowSeq.value);
+      localStorage.setItem('miloto_draw', drawInput.value);
     }
 
     function goGenerate(extraParams = {}){
@@ -579,6 +700,10 @@ def index():
       if(startDate.value) params.set('start', startDate.value);
       if(hotInput.value.trim().length > 0) params.set('hot', hotInput.value.trim());
       params.set('hot_count', hotCount.value);
+
+      params.set('allow_seq', allowSeq.value);
+
+      if(drawInput.value.trim().length > 0) params.set('draw', drawInput.value.trim());
 
       if(sorteosCsv.value.trim().length > 0) params.set('sorteos_csv', sorteosCsv.value.trim());
       if(jugadasCsv.value.trim().length > 0) params.set('jugadas_csv', jugadasCsv.value.trim());
@@ -604,8 +729,13 @@ def index():
 
     suggestBtn.addEventListener('click', () => {
       saveSettings();
-      // use_suggested=1 hará que el servidor lea CSV y rellene hotInput
       goGenerate({use_suggested: "1"});
+    });
+
+    checkBtn.addEventListener('click', () => {
+      saveSettings();
+      // solo recalcula con el parámetro draw (y mantiene todo lo demás)
+      goGenerate();
     });
 
     loadSettings();
@@ -620,6 +750,9 @@ def index():
             self.__dict__.update(d)
 
     hot_stats_table_obj = [RowObj(x) for x in hot_stats_table] if hot_stats_table else None
+
+    # adaptar verify_rows
+    verify_rows_obj = [RowObj(x) for x in verify_rows] if verify_rows else None
 
     return render_template_string(
         html,
@@ -636,7 +769,11 @@ def index():
         top_n_int=top_n_int,
         min_played_int=min_played_int,
         sheets_error=sheets_error,
-        hot_stats_table=hot_stats_table_obj
+        hot_stats_table=hot_stats_table_obj,
+        allow_sequences=allow_sequences,
+        draw_result_str=draw_result_str,
+        draw_invalid=draw_invalid,
+        verify_rows=verify_rows_obj
     )
 
 
