@@ -55,6 +55,20 @@ def parse_date_yyyy_mm_dd(s: str) -> date | None:
         return None
 
 
+def parse_date_flexible(s: str) -> date | None:
+    """Acepta '2026-02-03' o '03/02/2026' o '03-02-2026'."""
+    if not s:
+        return None
+    s = str(s).strip()
+    fmts = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"]
+    for f in fmts:
+        try:
+            return datetime.strptime(s, f).date()
+        except:
+            pass
+    return None
+
+
 def is_payroll_day(d: date) -> bool:
     return d.day in PAYROLL_DAYS
 
@@ -153,7 +167,7 @@ def generate_combination(hot_numbers, hot_count, allow_sequences: bool):
         if lows in (0, 5):
             continue
 
-        # ✅ NUEVO: permitir o no secuencias
+        # ✅ Permitir o no secuencias
         if not allow_sequences:
             if has_run_of_three_or_more(comb_list):
                 continue
@@ -258,7 +272,6 @@ def parse_draw_result(result_str: str):
         if n < 1 or n > MAX_NUMBER:
             return None
         nums.append(n)
-    # permitir repetidos? en MiLoto no deberían existir repetidos
     if len(set(nums)) != 5:
         return None
     return nums
@@ -281,6 +294,120 @@ def classify_hits(hits: int):
     return ""
 
 
+# ---------- NUEVO: Hot actuales + Resumen + Cruce Jugadas vs Sorteos ----------
+
+def build_sorteos_map(sorteos_url: str):
+    """
+    Lee EXPORT_SORTEOS y retorna:
+    - mapa: {date: set(nums)}
+    - lista_ordenada: [(date, [n1..n5]), ...] orden ascendente
+    """
+    rows = fetch_csv_rows(sorteos_url)
+    out = []
+    for r in rows:
+        d = parse_date_flexible(r.get("fecha_iso") or r.get("fecha") or r.get("FECHA") or r.get("SORTEOID"))
+        if not d:
+            continue
+        nums = []
+        for k in ["N1", "N2", "N3", "N4", "N5"]:
+            n = safe_int(r.get(k, ""))
+            if n and 1 <= n <= MAX_NUMBER:
+                nums.append(n)
+        if len(nums) == 5 and len(set(nums)) == 5:
+            out.append((d, nums))
+
+    out.sort(key=lambda x: x[0])
+    mapa = {d: set(nums) for d, nums in out}
+    return mapa, out
+
+
+def compute_current_hot(sorteos_url: str, last_n_draws: int = 20, top_k: int = 6):
+    """
+    Hot actuales = frecuencia en los últimos N sorteos.
+    Retorna (hot_list, preview_table, from_date, to_date)
+    """
+    _, sorteos_list = build_sorteos_map(sorteos_url)
+    recent = sorteos_list[-last_n_draws:] if last_n_draws > 0 else sorteos_list[:]
+    freq = {n: 0 for n in range(1, MAX_NUMBER + 1)}
+
+    for _, nums in recent:
+        for n in nums:
+            freq[n] += 1
+
+    table = [{"n": n, "freq_recent": freq[n]} for n in range(1, MAX_NUMBER + 1)]
+    table.sort(key=lambda x: x["freq_recent"], reverse=True)
+
+    hot_list = [x["n"] for x in table[:top_k]]
+    from_date = recent[0][0] if recent else None
+    to_date = recent[-1][0] if recent else None
+
+    return hot_list, table[:max(top_k, 12)], from_date, to_date
+
+
+def compute_jugadas_stats(sorteos_url: str, jugadas_url: str, limit_recent: int = 20):
+    """
+    Cruza JUGADAS vs SORTEOS por fecha y calcula aciertos.
+    Retorna summary + recent_rows.
+    """
+    sorteos_map, sorteos_list = build_sorteos_map(sorteos_url)
+    jugadas_rows = fetch_csv_rows(jugadas_url)
+
+    dist = {i: 0 for i in range(0, 6)}
+    total = 0
+    tickets = 0
+    premios = 0
+
+    computed_rows = []
+
+    for r in jugadas_rows:
+        d = parse_date_flexible(r.get("FECHA") or r.get("fecha") or r.get("fecha_iso"))
+        if not d:
+            continue
+
+        nums = []
+        for k in ["J1", "J2", "J3", "J4", "J5"]:
+            n = safe_int(r.get(k, ""))
+            if n and 1 <= n <= MAX_NUMBER:
+                nums.append(n)
+
+        if len(nums) != 5 or len(set(nums)) != 5:
+            continue
+
+        draw_set = sorteos_map.get(d)
+        if not draw_set:
+            hits = None
+            msg = "⏳ Sin sorteo en tu Sheet"
+        else:
+            hits = len(set(nums) & draw_set)
+            msg = classify_hits(hits)
+
+            total += 1
+            dist[hits] += 1
+            if hits == 2:
+                tickets += 1
+            if hits >= 3:
+                premios += 1
+
+        computed_rows.append({
+            "date": d,
+            "combo": nums,
+            "hits": hits,
+            "msg": msg
+        })
+
+    computed_rows.sort(key=lambda x: x["date"])
+    recent_rows = computed_rows[-limit_recent:] if limit_recent > 0 else computed_rows
+
+    summary = {
+        "total": total,
+        "dist": dist,
+        "tickets": tickets,
+        "premios": premios,
+        "last_draw_date": sorteos_list[-1][0] if sorteos_list else None
+    }
+    return summary, recent_rows
+
+
 @app.route("/", methods=["GET"])
 def index():
     # UI params
@@ -290,13 +417,17 @@ def index():
     start_str = request.args.get("start", "")
     start_date = parse_date_yyyy_mm_dd(start_str)
 
-    # ✅ NUEVO: permitir secuencias
+    # ✅ permitir secuencias
     allow_seq = request.args.get("allow_seq", "0")  # 0=NO (estricto), 1=SI
     allow_sequences = (allow_seq == "1")
 
-    # ✅ NUEVO: resultado del sorteo para verificar aciertos
+    # ✅ resultado del sorteo para verificar aciertos
     draw_result_str = request.args.get("draw", "").strip()
     draw_nums = parse_draw_result(draw_result_str)
+
+    # ✅ NUEVO: cargar resumen estadístico desde Sheets
+    load_stats = request.args.get("stats", "0")  # 1=SI
+    stats_enabled = (load_stats == "1")
 
     # Sheets params
     sorteos_url = request.args.get("sorteos_csv", DEFAULT_SORTEOS_CSV).strip()
@@ -323,8 +454,15 @@ def index():
 
     error = None
     sheets_error = None
-    suggested_hot = None
     hot_stats_table = None
+
+    # Stats UI
+    stats_error = None
+    current_hot = None
+    current_hot_table = None
+    current_hot_range = None
+    jugadas_summary = None
+    jugadas_recent = None
 
     if use_suggested == "1":
         try:
@@ -338,6 +476,20 @@ def index():
             hot_str = ", ".join(str(x) for x in suggested_hot)
         except Exception as e:
             sheets_error = f"No pude leer/parsear tus CSV: {e}"
+
+    # ✅ cargar resumen si está activo
+    if stats_enabled:
+        try:
+            current_hot, current_hot_table, hot_from, hot_to = compute_current_hot(
+                sorteos_url=sorteos_url, last_n_draws=20, top_k=6
+            )
+            current_hot_range = (hot_from, hot_to)
+
+            jugadas_summary, jugadas_recent = compute_jugadas_stats(
+                sorteos_url=sorteos_url, jugadas_url=jugadas_url, limit_recent=20
+            )
+        except Exception as e:
+            stats_error = f"No pude calcular stats desde Sheets: {e}"
 
     try:
         hot_numbers = parse_int_list(hot_str) if hot_str else DEFAULT_HOT
@@ -383,7 +535,6 @@ def index():
         else:
             draw_set = set(draw_nums)
             verify_rows = []
-            # Aplanamos combos con su fecha
             for d, n, cs in calendar:
                 for c in cs:
                     hits = len(set(c) & draw_set)
@@ -613,6 +764,82 @@ def index():
     {% endif %}
   </div>
 
+  <div class="card">
+    <div class="date">Resumen estadístico (desde Google Sheets)</div>
+
+    <div class="row">
+      <div class="field">
+        <label>Cargar resumen</label>
+        <select id="statsToggle">
+          <option value="0" {% if not stats_enabled %}selected{% endif %}>NO</option>
+          <option value="1" {% if stats_enabled %}selected{% endif %}>SÍ</option>
+        </select>
+        <div class="hint">Si activas SÍ, la app lee tus CSV y arma el resumen (puede tardar unos segundos).</div>
+      </div>
+
+      <button id="statsBtn" type="button">📊 Actualizar resumen</button>
+    </div>
+
+    {% if stats_error %}
+      <div class="warn" style="margin-top:10px;"><b>Stats:</b> {{ stats_error }}</div>
+    {% endif %}
+
+    {% if stats_enabled and jugadas_summary %}
+      <div style="margin-top:12px;">
+        <div class="small">
+          <b>Total jugadas evaluadas:</b> {{ jugadas_summary.total }} |
+          <b>Tickets:</b> {{ jugadas_summary.tickets }} |
+          <b>Premios (3+):</b> {{ jugadas_summary.premios }}
+        </div>
+
+        <div class="small" style="margin-top:8px;">
+          <b>Distribución de aciertos:</b>
+          0: {{ jugadas_summary.dist[0] }},
+          1: {{ jugadas_summary.dist[1] }},
+          2: {{ jugadas_summary.dist[2] }},
+          3: {{ jugadas_summary.dist[3] }},
+          4: {{ jugadas_summary.dist[4] }},
+          5: {{ jugadas_summary.dist[5] }}
+        </div>
+
+        {% if current_hot %}
+          <div class="small" style="margin-top:10px;">
+            <b>Hot actuales (últimos 20 sorteos):</b> {{ current_hot|join(', ') }}
+            {% if current_hot_range and current_hot_range[0] and current_hot_range[1] %}
+              <span class="muted"> ({{ current_hot_range[0] }} → {{ current_hot_range[1] }})</span>
+            {% endif %}
+          </div>
+        {% endif %}
+
+        {% if jugadas_recent %}
+          <div style="margin-top:12px;">
+            <div class="small"><b>Últimas jugadas (cruce por fecha)</b></div>
+            <table style="margin-top:6px;">
+              <thead>
+                <tr>
+                  <th>Fecha</th>
+                  <th>Jugada</th>
+                  <th>Aciertos</th>
+                  <th>Resultado</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for r in jugadas_recent %}
+                  <tr>
+                    <td>{{ r.date }}</td>
+                    <td><b>{{ r.combo|join(' - ') }}</b></td>
+                    <td>{% if r.hits is not none %}<b>{{ r.hits }}</b>{% else %}—{% endif %}</td>
+                    <td>{{ r.msg }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+      </div>
+    {% endif %}
+  </div>
+
   {% for d, n, combos in calendar %}
     <div class="card">
       <div class="date">
@@ -644,6 +871,9 @@ def index():
 
     const drawInput = document.getElementById('drawInput');
 
+    const statsToggle = document.getElementById('statsToggle');
+    const statsBtn = document.getElementById('statsBtn');
+
     const saveBtn = document.getElementById('saveBtn');
     const genBtn  = document.getElementById('genBtn');
     const suggestBtn = document.getElementById('suggestBtn');
@@ -659,6 +889,7 @@ def index():
       const savedMinPlayed = localStorage.getItem('miloto_min_played');
       const savedAllowSeq = localStorage.getItem('miloto_allow_seq');
       const savedDraw = localStorage.getItem('miloto_draw');
+      const savedStats = localStorage.getItem('miloto_stats');
 
       if(savedHot && !hotInput.value) hotInput.value = savedHot;
       if(savedCount) hotCount.value = savedCount;
@@ -680,6 +911,7 @@ def index():
       if(savedMinPlayed) minPlayed.value = savedMinPlayed;
       if(savedAllowSeq) allowSeq.value = savedAllowSeq;
       if(savedDraw && (!drawInput.value || drawInput.value.trim().length === 0)) drawInput.value = savedDraw;
+      if(savedStats) statsToggle.value = savedStats;
     }
 
     function saveSettings(){
@@ -692,6 +924,7 @@ def index():
       localStorage.setItem('miloto_min_played', minPlayed.value);
       localStorage.setItem('miloto_allow_seq', allowSeq.value);
       localStorage.setItem('miloto_draw', drawInput.value);
+      localStorage.setItem('miloto_stats', statsToggle.value);
     }
 
     function goGenerate(extraParams = {}){
@@ -704,6 +937,9 @@ def index():
       params.set('allow_seq', allowSeq.value);
 
       if(drawInput.value.trim().length > 0) params.set('draw', drawInput.value.trim());
+
+      // ✅ NUEVO: resumen stats
+      params.set('stats', statsToggle.value);
 
       if(sorteosCsv.value.trim().length > 0) params.set('sorteos_csv', sorteosCsv.value.trim());
       if(jugadasCsv.value.trim().length > 0) params.set('jugadas_csv', jugadasCsv.value.trim());
@@ -734,7 +970,11 @@ def index():
 
     checkBtn.addEventListener('click', () => {
       saveSettings();
-      // solo recalcula con el parámetro draw (y mantiene todo lo demás)
+      goGenerate();
+    });
+
+    statsBtn.addEventListener('click', () => {
+      saveSettings();
       goGenerate();
     });
 
@@ -744,15 +984,17 @@ def index():
 </html>
 """
 
-    # adaptar hot_stats_table para jinja (dict -> obj-like)
     class RowObj:
         def __init__(self, d):
             self.__dict__.update(d)
 
     hot_stats_table_obj = [RowObj(x) for x in hot_stats_table] if hot_stats_table else None
-
-    # adaptar verify_rows
     verify_rows_obj = [RowObj(x) for x in verify_rows] if verify_rows else None
+
+    current_hot_table_obj = [RowObj(x) for x in current_hot_table] if current_hot_table else None
+    jugadas_recent_obj = [RowObj(x) for x in jugadas_recent] if jugadas_recent else None
+
+    jugadas_summary_obj = RowObj(jugadas_summary) if jugadas_summary else None
 
     return render_template_string(
         html,
@@ -773,7 +1015,15 @@ def index():
         allow_sequences=allow_sequences,
         draw_result_str=draw_result_str,
         draw_invalid=draw_invalid,
-        verify_rows=verify_rows_obj
+        verify_rows=verify_rows_obj,
+        # ✅ stats
+        stats_enabled=stats_enabled,
+        stats_error=stats_error,
+        current_hot=current_hot,
+        current_hot_table=current_hot_table_obj,
+        current_hot_range=current_hot_range,
+        jugadas_summary=jugadas_summary_obj,
+        jugadas_recent=jugadas_recent_obj
     )
 
 
